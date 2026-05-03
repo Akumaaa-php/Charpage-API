@@ -1,0 +1,19 @@
+.cache/
+node_modules/
+
+# Local render/debug output
+*.png
+*.gif
+*.webp
+item-test.html
+server.log
+server.err.log
+npm-debug.log*
+
+# Environment/local config
+.env
+.env.*
+
+# OS/editor files
+.DS_Store
+Thumbs.db

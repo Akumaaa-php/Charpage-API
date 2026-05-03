@@ -1,0 +1,7 @@
+.cache
+node_modules
+npm-debug.log
+*.png
+*.gif
+server.log
+server.err.log
