@@ -1,10 +1,10 @@
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
-const [, , characterName, outputPath, origin = "http://localhost:3000", mode = "viewer", petMode = "nopet", sourceMode = "template"] = process.argv;
+const [, , characterName, outputPath, origin = "http://localhost:3000", mode = "viewer", petMode = "nopet", sourceMode = "template", characterJsonPath = ""] = process.argv;
 const itemModes = new Set(petMode.split(",").map((value) => value.trim()).filter(Boolean));
 const includePet = itemModes.has("pet");
 const includeGround = itemModes.has("ground");
@@ -14,6 +14,10 @@ const stageHeight = useCustomViewer ? 1119 : 455;
 const useTemplateScale = sourceMode === "template" || sourceMode === "profile" || useCustomViewer;
 const renderScale = useTemplateScale ? 3 : 1;
 const outputFormat = outputPath.toLowerCase().endsWith(".png") ? "png" : "gif";
+const customNetworkIdleTimeoutMs = Math.max(500, Number(process.env.RENDER_CUSTOM_NETWORK_IDLE_MS || 1200));
+const customSettleMs = Math.max(1000, Number(process.env.RENDER_CUSTOM_SETTLE_MS || 1800));
+const defaultNetworkIdleTimeoutMs = Math.max(1000, Number(process.env.RENDER_NETWORK_IDLE_MS || 12000));
+const defaultSettleMs = Math.max(1000, Number(process.env.RENDER_SETTLE_MS || 3200));
 
 if (!characterName || !outputPath) {
   console.error("Usage: node src/render-gif.mjs <characterName> <outputPath> [origin] [mode] [pet|nopet] [profile|template|viewer]");
@@ -21,6 +25,14 @@ if (!characterName || !outputPath) {
 }
 
 const require = createRequire(import.meta.url);
+
+async function loadCharacter() {
+  if (characterJsonPath) {
+    return JSON.parse(await readFile(characterJsonPath, "utf8"));
+  }
+
+  return (await (await fetch(`${origin}/api/character/${encodeURIComponent(characterName)}?pet=${includePet ? "1" : "0"}&ground=${includeGround ? "1" : "0"}`)).json());
+}
 
 function optionalRequire(name) {
   try {
@@ -187,14 +199,21 @@ function renderHtml(character, blank = false, cleanText = false) {
       ]
     };
   </script>
-  <script src="https://unpkg.com/@ruffle-rs/ruffle"></script>
+  <script src="${origin}/vendor/ruffle/ruffle.js"></script>
 </body>
 </html>`;
 }
 
 async function captureFrames(page, framePaths, blank = false, cleanText = false) {
-  await page.setContent(renderHtml(character, blank, cleanText), { waitUntil: "networkidle", timeout: 90000 });
-  await page.waitForTimeout(blank ? 4500 : 6000);
+  await page.setContent(renderHtml(character, blank, cleanText), { waitUntil: "domcontentloaded", timeout: 90000 });
+  await page.waitForLoadState("networkidle", { timeout: useCustomViewer ? customNetworkIdleTimeoutMs : defaultNetworkIdleTimeoutMs }).catch(() => {});
+
+  if (blank) {
+    await page.waitForTimeout(900);
+  } else {
+    await page.waitForFunction(() => document.querySelector("ruffle-player"), null, { timeout: 12000 }).catch(() => {});
+    await page.waitForTimeout(useCustomViewer ? customSettleMs : defaultSettleMs);
+  }
 
   if (blank) {
     await page.screenshot({
@@ -1652,7 +1671,7 @@ if (CHROME_EXE) {
 const browser = await chromium.launch(launchOptions);
 
 try {
-  var character = await (await fetch(`${origin}/api/character/${encodeURIComponent(characterName)}`)).json();
+  var character = await loadCharacter();
   const missing = character.assets.files.filter((asset) =>
     !asset.available &&
     (includePet || !asset.gameFilePath.includes("/pets/")) &&
@@ -1677,7 +1696,11 @@ try {
 
   const cleanOutput = mode !== "full";
   const backgroundPath = path.join(frameDir, "background.png");
-  await captureFrames(page, [backgroundPath], true, cleanOutput);
+
+  if (!useCustomViewer) {
+    await captureFrames(page, [backgroundPath], true, cleanOutput);
+  }
+
   await captureFrames(page, framePaths, false, cleanOutput);
   await encodeGif(framePaths, backgroundPath, cleanOutput);
 } finally {

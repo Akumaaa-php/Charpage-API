@@ -37,6 +37,7 @@ http://localhost:3000/api/character/Selena/png?refresh=1
 | Method | Route | Description |
 | --- | --- | --- |
 | `GET` | `/` | Small route index. |
+| `GET` | `/health` | Health check for production hosts. |
 | `GET` | `/character/:name` | Browser preview page for a character. |
 | `GET` | `/api/character/:name` | Character JSON, FlashVars, equipment, and asset metadata. |
 | `GET` | `/api/character/:name/png` | Transparent PNG portrait. |
@@ -120,7 +121,7 @@ Use these settings:
 | Root directory | Leave blank |
 | Dockerfile path | `Dockerfile` |
 | Instance type | Free or higher |
-| Health check path | `/` |
+| Health check path | `/health` |
 
 Recommended environment variables:
 
@@ -130,6 +131,8 @@ PYTHON_EXE=python3
 AQW_FETCH_LIMIT=2
 AQW_FETCH_WINDOW_MS=3000
 NODE_ENV=production
+LOG_TIME_ZONE=Asia/Manila
+REQUEST_FILE_LOG=0
 ```
 
 After deploy, test:
@@ -168,6 +171,10 @@ AQW_FETCH_WINDOW_MS=5000
 | `CHROME_EXE` | auto-detected | Optional explicit Chromium or Chrome executable path. |
 | `AQW_FETCH_LIMIT` | `2` | Number of AQW SWF fetches allowed per throttle window. |
 | `AQW_FETCH_WINDOW_MS` | `3000` | Throttle window duration in milliseconds. |
+| `LOG_TIME_ZONE` | `Asia/Manila` | Time zone used in character request logs. |
+| `REQUEST_FILE_LOG` | local: `1`, production: `0` | Set to `1` to also write `.cache/logs/requests.log`; console logs are always enabled. |
+| `RENDER_CUSTOM_NETWORK_IDLE_MS` | `1200` | Custom viewer network wait before screenshot capture. |
+| `RENDER_CUSTOM_SETTLE_MS` | `1800` | Custom viewer settle wait before screenshot capture. |
 
 ## Cache
 
@@ -176,9 +183,24 @@ Generated and downloaded files are stored under `.cache/`:
 ```text
 .cache/aqw-gamefiles
 .cache/renders
+.cache/ruffle
+.cache/logs
 ```
 
 These files are intentionally ignored by Git. Keep the source clean and let the app rebuild cache as needed.
+
+## Request Logs
+
+Character routes log the requested username, IP address, time, and date to stdout for Render or Docker logs:
+
+```text
+Username: Selena
+IP Address: 127.0.0.1
+Time: 01:13:00 PM
+Date: 2026-05-04
+```
+
+Set `REQUEST_FILE_LOG=1` if you also want local file logs in `.cache/logs/requests.log`.
 
 ## Project Structure
 

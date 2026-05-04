@@ -1,7 +1,8 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildCompositorManifest } from "./compositor.js";
@@ -11,32 +12,24 @@ const AQ_CHARPAGE_URL = "https://account.aq.com/CharPage";
 const AQ_GAME_FILES_URL = "https://game.aq.com/game/gamefiles";
 const LOCAL_GAME_FILES_PREFIX = "/aqw/gamefiles/";
 const LOCAL_CACHE_PREFIX = "/cache/aqw/";
+const LOCAL_RUFFLE_PREFIX = "/vendor/ruffle/";
 const CACHE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".cache", "aqw-gamefiles");
 const RENDER_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".cache", "renders");
+const RUFFLE_CACHE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".cache", "ruffle");
+const REQUEST_LOG_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".cache", "logs", "requests.log");
 const NODE_EXE = process.execPath;
 const DEFAULT_PORT = Number(process.env.PORT || 3000);
+const RUFFLE_CDN_BASE = (process.env.RUFFLE_CDN_BASE || "https://unpkg.com/@ruffle-rs/ruffle@0.2.0-nightly.2026.5.4").replace(/\/+$/, "");
+const LOG_TIME_ZONE = process.env.LOG_TIME_ZONE || "Asia/Manila";
+const REQUEST_FILE_LOG =
+  process.env.REQUEST_FILE_LOG === "1" ||
+  (process.env.REQUEST_FILE_LOG !== "0" && process.env.NODE_ENV !== "production");
 const SHARED_VIEWER_CACHE_KEY = "_shared";
 const CUSTOM_VIEWER_CACHE_KEY = "_custom";
 const CUSTOM_VIEWER_GAME_FILE_PATH = "etc/chardetail/characterMinimal.swf";
 const AQW_FETCH_LIMIT = Math.max(1, Number(process.env.AQW_FETCH_LIMIT || 2));
 const AQW_FETCH_WINDOW_MS = Math.max(250, Number(process.env.AQW_FETCH_WINDOW_MS || 3000));
-const AQW_BROWSER_USER_AGENT =
-  process.env.AQW_USER_AGENT ||
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-const AQW_CHARPAGE_HEADERS = {
-  "User-Agent": AQW_BROWSER_USER_AGENT,
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Cache-Control": "no-cache",
-  "Pragma": "no-cache",
-  "Referer": "https://account.aq.com/"
-};
-const AQW_GAME_FILE_HEADERS = {
-  "User-Agent": AQW_BROWSER_USER_AGENT,
-  "Accept": "application/x-shockwave-flash,application/octet-stream,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Referer": "https://account.aq.com/CharPage"
-};
+const RENDER_MANIFEST_VERSION = "flashvars-v1";
 const DOWNLOADS_DIR = process.env.USERPROFILE
   ? path.join(process.env.USERPROFILE, "Downloads")
   : path.resolve("Downloads");
@@ -153,6 +146,71 @@ function cacheFilePath(cacheKey, gameFilePath) {
 
 function cacheFileUrl(cacheKey, gameFilePath) {
   return `${LOCAL_CACHE_PREFIX}${encodeURIComponent(cacheKey)}/${gameFilePath.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) {
+    return value.map(stableJson);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, stableJson(value[key])])
+    );
+  }
+
+  return value;
+}
+
+function sha256(value) {
+  return createHash("sha256").update(JSON.stringify(stableJson(value))).digest("hex");
+}
+
+function renderManifestPath(outputPath) {
+  return `${outputPath}.json`;
+}
+
+function renderInputHash(character, options) {
+  return sha256({
+    version: RENDER_MANIFEST_VERSION,
+    flashVars: character.flashVars,
+    swfUrl: character.swfUrl,
+    options
+  });
+}
+
+function renderCacheSignature(character, options) {
+  return {
+    flashVarsHash: sha256(character.flashVars),
+    optionsHash: sha256({
+      version: RENDER_MANIFEST_VERSION,
+      options
+    })
+  };
+}
+
+async function readRenderManifest(outputPath) {
+  try {
+    return JSON.parse(await readFile(renderManifestPath(outputPath), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function writeRenderManifest(outputPath, manifest) {
+  await writeFile(renderManifestPath(outputPath), `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+async function canReuseRender(outputPath, expectedSignature) {
+  if (!(await fileExists(outputPath))) return false;
+
+  const manifest = await readRenderManifest(outputPath);
+  return (
+    manifest?.flashVarsHash === expectedSignature.flashVarsHash &&
+    manifest?.optionsHash === expectedSignature.optionsHash
+  );
 }
 
 async function fileExists(filePath) {
@@ -290,6 +348,73 @@ function getGameFileContentType(pathname, upstreamType) {
   return "application/octet-stream";
 }
 
+function getRuffleContentType(fileName) {
+  if (fileName.endsWith(".js")) return "text/javascript; charset=utf-8";
+  if (fileName.endsWith(".wasm")) return "application/wasm";
+  return "application/octet-stream";
+}
+
+function normalizeRuffleFileName(value) {
+  const fileName = String(value || "").trim();
+
+  if (!/^[a-z0-9._-]+$/i.test(fileName)) return null;
+  if (!fileName.endsWith(".js") && !fileName.endsWith(".wasm")) return null;
+
+  return fileName;
+}
+
+async function ensureRuffleFile(fileName) {
+  const safeName = normalizeRuffleFileName(fileName);
+
+  if (!safeName) {
+    throw Object.assign(new Error("Invalid Ruffle file path."), { status: 400 });
+  }
+
+  const destination = path.join(RUFFLE_CACHE_DIR, safeName);
+
+  if (await fileExists(destination)) {
+    return destination;
+  }
+
+  await mkdir(RUFFLE_CACHE_DIR, { recursive: true });
+  const response = await fetch(`${RUFFLE_CDN_BASE}/${safeName}`, {
+    headers: {
+      "User-Agent": "aqworlds-character-api/1.0"
+    }
+  });
+
+  if (!response.ok) {
+    throw Object.assign(new Error(`Ruffle returned ${response.status}.`), {
+      status: 502
+    });
+  }
+
+  const content = Buffer.from(await response.arrayBuffer());
+  await writeFile(destination, content);
+
+  return destination;
+}
+
+async function serveRuffleFile(reqUrl, res) {
+  const fileName = normalizeRuffleFileName(decodeURIComponent(reqUrl.pathname.slice(LOCAL_RUFFLE_PREFIX.length)));
+
+  if (!fileName) {
+    send(res, 400, "application/json; charset=utf-8", JSON.stringify({ error: "Invalid Ruffle file path." }));
+    return;
+  }
+
+  const filePath = await ensureRuffleFile(fileName);
+  const info = await stat(filePath);
+
+  res.writeHead(200, {
+    "Content-Type": getRuffleContentType(fileName),
+    "Content-Length": info.size,
+    "Cache-Control": "public, max-age=31536000, immutable",
+    "Access-Control-Allow-Origin": "*"
+  });
+  createReadStream(filePath).pipe(res);
+}
+
 async function proxyGameFile(reqUrl, res) {
   const suffix = reqUrl.pathname.slice(LOCAL_GAME_FILES_PREFIX.length);
 
@@ -300,7 +425,9 @@ async function proxyGameFile(reqUrl, res) {
 
   const upstreamUrl = `${AQ_GAME_FILES_URL}/${suffix}${reqUrl.search}`;
   const response = await fetchAqwGameFile(upstreamUrl, {
-    headers: AQW_GAME_FILE_HEADERS
+    headers: {
+      "User-Agent": "aqworlds-character-api/1.0"
+    }
   });
 
   if (!response.ok) {
@@ -391,7 +518,9 @@ async function downloadGameFile(cacheKey, gameFilePath) {
   for (const remoteUrl of remoteCandidatesForGameFile(gameFilePath)) {
     try {
       const response = await fetchAqwGameFile(remoteUrl, {
-        headers: AQW_GAME_FILE_HEADERS
+        headers: {
+          "User-Agent": "Mozilla/5.0 aqworlds-character-api/1.0"
+        }
       });
 
       attempts.push({
@@ -487,35 +616,16 @@ async function prepareCharacterAssets(character, options = {}) {
   const includeGround = options.includeGround === true;
   const cacheKey = cacheKeyForName(character.name);
   const swfFiles = collectCharacterSwfFiles(character, { includePet, includeGround });
-  const downloads = [];
-  let rateLimitedError = "";
-
-  for (const gameFilePath of swfFiles) {
+  const downloads = await Promise.all(swfFiles.map(async (gameFilePath) => {
     const assetCacheKey = isSharedViewerSwf(gameFilePath) ? SHARED_VIEWER_CACHE_KEY : cacheKey;
-
-    if (rateLimitedError) {
-      downloads.push({
-        gameFilePath,
-        requestedLocalUrl: cacheFileUrl(assetCacheKey, gameFilePath),
-        directUrl: directGameFileUrl(gameFilePath),
-        available: false,
-        skipped: true,
-        error: rateLimitedError
-      });
-      continue;
-    }
-
     const asset = await downloadGameFile(assetCacheKey, gameFilePath);
-    downloads.push({
+
+    return {
       ...asset,
       cacheKey: assetCacheKey,
       shared: assetCacheKey === SHARED_VIEWER_CACHE_KEY
-    });
-
-    if (asset.error?.includes("429")) {
-      rateLimitedError = asset.error;
-    }
-  }
+    };
+  }));
 
   const mainPath = normalizeGameFilePath(character.swfUrl);
 
@@ -531,29 +641,7 @@ async function prepareCharacterAssets(character, options = {}) {
 async function prepareItemAssets(character) {
   const cacheKey = cacheKeyForName(character.name);
   const swfFiles = collectItemSwfFiles(character);
-  const downloads = [];
-  let rateLimitedError = "";
-
-  for (const gameFilePath of swfFiles) {
-    if (rateLimitedError) {
-      downloads.push({
-        gameFilePath,
-        requestedLocalUrl: cacheFileUrl(cacheKey, gameFilePath),
-        directUrl: directGameFileUrl(gameFilePath),
-        available: false,
-        skipped: true,
-        error: rateLimitedError
-      });
-      continue;
-    }
-
-    const asset = await downloadGameFile(cacheKey, gameFilePath);
-    downloads.push(asset);
-
-    if (asset.error?.includes("429")) {
-      rateLimitedError = asset.error;
-    }
-  }
+  const downloads = await Promise.all(swfFiles.map((gameFilePath) => downloadGameFile(cacheKey, gameFilePath)));
 
   return {
     cacheKey,
@@ -716,7 +804,7 @@ else:
   ]);
 }
 
-async function renderCharacterImage(characterName, reqUrl) {
+async function renderCharacterImage(characterName, reqUrl, character) {
   const cacheKey = cacheKeyForName(characterName);
   await mkdir(RENDER_DIR, { recursive: true });
 
@@ -736,13 +824,36 @@ async function renderCharacterImage(characterName, reqUrl) {
     includeGround ? "ground" : "noground"
   ].join("-");
   const outputPath = path.join(RENDER_DIR, `${cacheKey}-${mode}-${layerKey}-${rendererKey}-${sourceMode}.png`);
+  const renderOptions = {
+    mode,
+    includePet,
+    includeGround,
+    sourceMode,
+    rendererKey
+  };
+  const inputHash = character ? renderInputHash(character, renderOptions) : null;
+  const cacheSignature = character ? renderCacheSignature(character, renderOptions) : null;
 
-  if (reqUrl.searchParams.get("refresh") !== "1" && await fileExists(outputPath)) {
+  if (cacheSignature && await canReuseRender(outputPath, cacheSignature)) {
+    return outputPath;
+  }
+
+  if (!inputHash && reqUrl.searchParams.get("refresh") !== "1" && await fileExists(outputPath)) {
     return outputPath;
   }
 
   if (useProfileSource) {
     await renderProfileGifFromDownload(profileSourcePath, outputPath);
+    if (inputHash) {
+      await writeRenderManifest(outputPath, {
+        inputHash,
+        ...cacheSignature,
+        character: character.name,
+        options: renderOptions,
+        renderer: "download",
+        updatedAt: new Date().toISOString()
+      });
+    }
     return outputPath;
   }
 
@@ -752,6 +863,8 @@ async function renderCharacterImage(characterName, reqUrl) {
 
   const scriptPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "render-gif.mjs");
   const origin = `http://${reqUrl.host}`;
+  const characterInputPath = `${outputPath}.input.json`;
+  await writeFile(characterInputPath, `${JSON.stringify(character)}\n`);
 
   await runProcess(NODE_EXE, [
     scriptPath,
@@ -763,10 +876,22 @@ async function renderCharacterImage(characterName, reqUrl) {
       includePet ? "pet" : "nopet",
       includeGround ? "ground" : "noground"
     ].join(","),
-    sourceMode
+    sourceMode,
+    characterInputPath
   ], {
     cwd: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
   });
+
+  if (inputHash) {
+    await writeRenderManifest(outputPath, {
+      inputHash,
+      ...cacheSignature,
+      character: character.name,
+      options: renderOptions,
+      renderer: "ruffle",
+      updatedAt: new Date().toISOString()
+    });
+  }
 
   return outputPath;
 }
@@ -775,13 +900,13 @@ async function fetchCharacter(name) {
   const characterName = normalizeName(name);
   const url = `${AQ_CHARPAGE_URL}?id=${encodeURIComponent(characterName)}`;
   const response = await fetch(url, {
-    headers: AQW_CHARPAGE_HEADERS
+    headers: {
+      "User-Agent": "aqworlds-character-api/1.0"
+    }
   });
 
   if (!response.ok) {
-    const retryAfter = response.headers.get("retry-after");
-    const cooldown = retryAfter ? ` Try again in about ${retryAfter} seconds.` : "";
-    throw Object.assign(new Error(`AQWorlds returned ${response.status}.${cooldown}`), {
+    throw Object.assign(new Error(`AQWorlds returned ${response.status}.`), {
       status: 502
     });
   }
@@ -965,9 +1090,8 @@ function renderCharacterOnlyPage(character) {
       urlRewriteRules: [
         [/^https?:\\/\\/game\\.aq\\.com\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
         [/^https?:\\/\\/game\\.aq\\.com\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
-        [/^https?:\\/\\/localhost(?::\\d+)?\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
-        [/^https?:\\/\\/127\\.0\\.0\\.1(?::\\d+)?\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
-        [/^https?:\\/\\/[^\\/]+\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
+        [/^https?:\\/\\/localhost\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
+        [/^https?:\\/\\/localhost:3000\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
         [/^\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"]
       ]
     };
@@ -989,8 +1113,9 @@ function renderCleanCompositorPage(character, reqUrl) {
 
   if (reqUrl.searchParams.get("refresh") === "1") {
     params.set("refresh", "1");
-    params.set("t", String(Date.now()));
   }
+
+  params.set("t", String(Date.now()));
 
   const imageUrl = `/api/character/${encodeURIComponent(character.name)}/png?${params}`;
   const usesCheckerBackground = previewBackground === "checker";
@@ -1141,6 +1266,71 @@ function getRouteName(pathname, prefix) {
   return rawName ? decodeURIComponent(rawName) : null;
 }
 
+function getRequestIp(req) {
+  const forwardedFor = Array.isArray(req.headers["x-forwarded-for"])
+    ? req.headers["x-forwarded-for"][0]
+    : req.headers["x-forwarded-for"];
+  const realIp = Array.isArray(req.headers["x-real-ip"])
+    ? req.headers["x-real-ip"][0]
+    : req.headers["x-real-ip"];
+  const cfIp = Array.isArray(req.headers["cf-connecting-ip"])
+    ? req.headers["cf-connecting-ip"][0]
+    : req.headers["cf-connecting-ip"];
+  const rawIp = (forwardedFor?.split(",")[0] || cfIp || realIp || req.socket.remoteAddress || "unknown").trim();
+
+  return rawIp.replace(/^::ffff:/, "").replace(/^::1$/, "127.0.0.1");
+}
+
+function formatLogDateTime(date) {
+  return {
+    date: new Intl.DateTimeFormat("en-CA", {
+      timeZone: LOG_TIME_ZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).format(date),
+    time: new Intl.DateTimeFormat("en-US", {
+      timeZone: LOG_TIME_ZONE,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true
+    }).format(date)
+  };
+}
+
+function logCharacterRequest(req, route, username) {
+  const loggedAt = new Date();
+  const { date, time } = formatLogDateTime(loggedAt);
+  const entry = {
+    ip: getRequestIp(req),
+    username: String(username || ""),
+    route,
+    path: req.url || "",
+    date,
+    time
+  };
+  const line = [
+    `Username: ${entry.username}`,
+    `IP Address: ${entry.ip}`,
+    `Time: ${entry.time}`,
+    `Date: ${entry.date}`,
+    `Route: ${entry.route}`,
+    `Path: ${entry.path}`,
+    ""
+  ].join("\n");
+
+  console.log(`[character-request] Username: ${entry.username} | IP Address: ${entry.ip} | Time: ${entry.time} | Date: ${entry.date}`);
+
+  if (!REQUEST_FILE_LOG) return;
+
+  mkdir(path.dirname(REQUEST_LOG_PATH), { recursive: true })
+    .then(() => appendFile(REQUEST_LOG_PATH, `${line}\n`))
+    .catch((error) => {
+      console.warn(`Failed to write request log: ${error.message}`);
+    });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -1179,10 +1369,25 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (url.pathname.startsWith(LOCAL_RUFFLE_PREFIX)) {
+      await serveRuffleFile(url, res);
+      return;
+    }
+
+    if (url.pathname === "/health") {
+      send(res, 200, "application/json; charset=utf-8", JSON.stringify({
+        status: "ok",
+        service: "aqworlds-character-api",
+        time: new Date().toISOString()
+      }));
+      return;
+    }
+
     if (url.pathname === "/") {
       send(res, 200, "text/plain; charset=utf-8", [
         "AQWorlds Character API",
         "",
+        "GET /health",
         "GET /api/character/:name",
         "GET /api/character/:name/compositor",
         "GET /api/character/:name/compiler",
@@ -1209,6 +1414,7 @@ const server = http.createServer(async (req, res) => {
       const imageName = pngName || legacyGifName;
 
       if (compositorApiName || compilerApiName) {
+        logCharacterRequest(req, compositorApiName ? "api-compositor" : "api-compiler", compositorApiName || compilerApiName);
         const includePet = url.searchParams.get("pet") === "1";
         const includeGround = url.searchParams.get("ground") === "1";
         const character = await fetchCharacter(compositorApiName || compilerApiName);
@@ -1225,6 +1431,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (imageName) {
+        logCharacterRequest(req, legacyGifName ? "api-gif" : "api-png", imageName);
         const includePet = url.searchParams.get("pet") === "1";
         const includeGround = url.searchParams.get("ground") === "1";
         const character = await fetchCharacter(imageName);
@@ -1239,7 +1446,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        const imagePath = await renderCharacterImage(imageName, url);
+        const imagePath = await renderCharacterImage(imageName, url, character);
         const info = await stat(imagePath);
         res.writeHead(200, {
           "Content-Type": "image/png",
@@ -1253,14 +1460,19 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      logCharacterRequest(req, "api-json", apiName);
       const character = await fetchCharacter(apiName);
-      character.assets = await prepareCharacterAssets(character);
+      character.assets = await prepareCharacterAssets(character, {
+        includePet: url.searchParams.get("pet") !== "0",
+        includeGround: url.searchParams.get("ground") === "1"
+      });
       send(res, 200, "application/json; charset=utf-8", JSON.stringify(character, null, 2));
       return;
     }
 
     const compileName = getRouteName(url.pathname, "/compile/");
     if (compileName) {
+      logCharacterRequest(req, "compile-page", compileName);
       const character = await fetchCharacter(compileName);
       send(res, 200, "text/html; charset=utf-8", renderCleanCompositorPage(character, url));
       return;
@@ -1268,6 +1480,7 @@ const server = http.createServer(async (req, res) => {
 
     const compositorName = getRouteName(url.pathname, "/compositor/");
     if (compositorName) {
+      logCharacterRequest(req, "compositor-page", compositorName);
       const character = await fetchCharacter(compositorName);
       send(res, 200, "text/html; charset=utf-8", renderCleanCompositorPage(character, url));
       return;
@@ -1275,6 +1488,7 @@ const server = http.createServer(async (req, res) => {
 
     const viewerName = getRouteName(url.pathname, "/character/");
     if (viewerName) {
+      logCharacterRequest(req, url.searchParams.get("swf") === "1" ? "character-swf-page" : "character-page", viewerName);
       const character = await fetchCharacter(viewerName);
 
       if (url.searchParams.get("swf") === "1") {

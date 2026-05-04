@@ -1,7 +1,11 @@
 .cache
 node_modules
+.git
+.env
+.env.*
 npm-debug.log
 *.png
 *.gif
+*.webp
 server.log
 server.err.log
