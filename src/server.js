@@ -965,8 +965,9 @@ function renderCharacterOnlyPage(character) {
       urlRewriteRules: [
         [/^https?:\\/\\/game\\.aq\\.com\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
         [/^https?:\\/\\/game\\.aq\\.com\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
-        [/^https?:\\/\\/localhost\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
-        [/^https?:\\/\\/localhost:3000\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
+        [/^https?:\\/\\/localhost(?::\\d+)?\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
+        [/^https?:\\/\\/127\\.0\\.0\\.1(?::\\d+)?\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
+        [/^https?:\\/\\/[^\\/]+\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"],
         [/^\\/game\\/gamefiles\\/(.*)$/i, aqwAssetBase + "$1"]
       ]
     };
