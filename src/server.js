@@ -20,6 +20,23 @@ const CUSTOM_VIEWER_CACHE_KEY = "_custom";
 const CUSTOM_VIEWER_GAME_FILE_PATH = "etc/chardetail/characterMinimal.swf";
 const AQW_FETCH_LIMIT = Math.max(1, Number(process.env.AQW_FETCH_LIMIT || 2));
 const AQW_FETCH_WINDOW_MS = Math.max(250, Number(process.env.AQW_FETCH_WINDOW_MS || 3000));
+const AQW_BROWSER_USER_AGENT =
+  process.env.AQW_USER_AGENT ||
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const AQW_CHARPAGE_HEADERS = {
+  "User-Agent": AQW_BROWSER_USER_AGENT,
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Cache-Control": "no-cache",
+  "Pragma": "no-cache",
+  "Referer": "https://account.aq.com/"
+};
+const AQW_GAME_FILE_HEADERS = {
+  "User-Agent": AQW_BROWSER_USER_AGENT,
+  "Accept": "application/x-shockwave-flash,application/octet-stream,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Referer": "https://account.aq.com/CharPage"
+};
 const DOWNLOADS_DIR = process.env.USERPROFILE
   ? path.join(process.env.USERPROFILE, "Downloads")
   : path.resolve("Downloads");
@@ -283,9 +300,7 @@ async function proxyGameFile(reqUrl, res) {
 
   const upstreamUrl = `${AQ_GAME_FILES_URL}/${suffix}${reqUrl.search}`;
   const response = await fetchAqwGameFile(upstreamUrl, {
-    headers: {
-      "User-Agent": "aqworlds-character-api/1.0"
-    }
+    headers: AQW_GAME_FILE_HEADERS
   });
 
   if (!response.ok) {
@@ -376,9 +391,7 @@ async function downloadGameFile(cacheKey, gameFilePath) {
   for (const remoteUrl of remoteCandidatesForGameFile(gameFilePath)) {
     try {
       const response = await fetchAqwGameFile(remoteUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 aqworlds-character-api/1.0"
-        }
+        headers: AQW_GAME_FILE_HEADERS
       });
 
       attempts.push({
@@ -762,13 +775,13 @@ async function fetchCharacter(name) {
   const characterName = normalizeName(name);
   const url = `${AQ_CHARPAGE_URL}?id=${encodeURIComponent(characterName)}`;
   const response = await fetch(url, {
-    headers: {
-      "User-Agent": "aqworlds-character-api/1.0"
-    }
+    headers: AQW_CHARPAGE_HEADERS
   });
 
   if (!response.ok) {
-    throw Object.assign(new Error(`AQWorlds returned ${response.status}.`), {
+    const retryAfter = response.headers.get("retry-after");
+    const cooldown = retryAfter ? ` Try again in about ${retryAfter} seconds.` : "";
+    throw Object.assign(new Error(`AQWorlds returned ${response.status}.${cooldown}`), {
       status: 502
     });
   }
